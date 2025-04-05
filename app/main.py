@@ -1,4 +1,4 @@
-#v1.2
+#v1.4 (fix 14)
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.thismydb.database import SessionLocal, engine
@@ -37,10 +37,10 @@ async def query_assets(request: QueryRequest, db: Session = Depends(get_db)):
     print(f"⭐💩 Processing question: {question}")
     
      # Check what assets are in the database
-    sample_assets = db.query(Asset).limit(3).all()
-    print("Sample assets in database:")
-    for asset in sample_assets:
-        print(f"  - Name: {asset.name}, Condition: {asset.condition}, Status ID: {asset.status_id}")
+    # sample_assets = db.query(Asset).limit(3).all()
+    # print("Sample assets in database:")
+    # for asset in sample_assets:
+    #     print(f"  - Name: {asset.name}, Condition: {asset.condition}, Status ID: {asset.status_id}")
     
     # Identify query intent and extract filters
     #PASSING IN DB HERE
@@ -110,10 +110,10 @@ async def debug_query(request: QueryRequest, db: Session = Depends(get_db)):
     # Get all assets for context
     assets = db.query(Asset).all()
     
-    # Print sample assets
-    print("Sample assets:")
-    for asset in assets[:3]:
-        print(asset)
+    # PRINTING FOR SAMPLE OUTPUT DEBUGGING
+    # print("Sample assets:")
+    # for asset in assets[:3]:
+    #     print(asset)
     
     # Create context
     context = " ".join([f"Asset: {asset.name}, Tag: {asset.asset_tag}, Serial: {asset.serial}" 
@@ -139,13 +139,14 @@ async def debug_query(request: QueryRequest, db: Session = Depends(get_db)):
         "end": result.get('end', None)
     }
 
-def analyze_query_intent(question, db: Session): #add db parameter
-    """Analyze the user's question to determine intent and extract filters"""
+#Modify the function to use the DeepSeek model to extract entities (locations, departments, statuses) from the query, while keeping rule-based logic as a fallback
+
+def analyze_query_intent(question, db: Session):
+    """Analyze the user's question using both rule-based and AI approaches"""
     question_lower = question.lower()
     print(f"Analyzing intent for: {question_lower}")
 
-    
-    # Check for direct asset tag lookup pattern
+    # Check for direct asset tag lookup
     import re
     uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     found_tags = re.findall(uuid_pattern, question_lower)
@@ -153,26 +154,92 @@ def analyze_query_intent(question, db: Session): #add db parameter
     if found_tags:
         return "asset_lookup_by_tag", {"asset_tag": found_tags[0]}
     
-    # Check for filtering intent
-    filter_keywords = {
-        "condition": ["condition", "state", "shape"],
-        "location": ["location", "where", "place", "office", "room"],
-        "department": ["department", "dept", "team", "group"],
-        "status": ["status", "available", "in use", "maintenance"]
-    }
+    # Prepare context for AI model, including the query itself
+    locations = [loc.name for loc in db.query(Location).all()]
+    departments = [dept.name for dept in db.query(Department).all()]
+    statuses = [status.name for status in db.query(Status).all()]
+    context_locations = f"Query: {question_lower}. Possible locations: {', '.join(loc.lower() for loc in locations)}."
+    context_departments = f"Query: {question_lower}. Possible departments: {', '.join(dept.lower() for dept in departments)}."
+    context_statuses = f"Query: {question_lower}. Possible statuses: {', '.join(status.lower() for status in statuses)}."
     
+    # Define possible intents and filters
     filters = {}
-    
-    # Keywords indicating we want to count assets
     count_indicators = ["how many", "count", "total number", "number of"]
     if any(indicator in question_lower for indicator in count_indicators):
         intent = "asset_count"
     else:
         intent = "asset_filter"
 
-    
-    """Explicit checks"""    
-     # Check for condition values explicitly
+    # Extract filters using AI, one entity type at a time
+    # Step 1: Extract location
+    nlp_input_location = {
+        "question": f"What location is mentioned in this query: {question}",
+        "context": context_locations
+    }
+    result_location = app.state.qa_pipeline(question=nlp_input_location["question"], context=nlp_input_location["context"])
+    ai_answer_location = result_location['answer'].lower()
+    ai_score_location = result_location['score']
+    print(f"AI Location Answer: {ai_answer_location}, Score: {ai_score_location}")
+
+    for loc in locations:
+        loc_lower = loc.lower()
+        if loc_lower in question_lower and loc_lower in ai_answer_location:
+            location = db.query(Location).filter(Location.name.ilike(loc)).first()
+            if location:
+                filters["location_id"] = location.id
+                print(f"AI detected location: {loc} (ID: {location.id})")
+                break
+    if "location_id" not in filters:
+        for loc in locations:
+            loc_lower = loc.lower()
+            if loc_lower in ai_answer_location and ai_score_location > 0.5:  # Raise threshold for fallback
+                location = db.query(Location).filter(Location.name.ilike(loc)).first()
+                if location:
+                    filters["location_id"] = location.id
+                    print(f"AI detected location: {loc} (ID: {location.id})")
+                    break
+
+    # Step 2: Extract department
+    nlp_input_department = {
+        "question": f"What department is mentioned in this query: {question}",
+        "context": context_departments
+    }
+    result_department = app.state.qa_pipeline(question=nlp_input_department["question"], context=nlp_input_department["context"])
+    ai_answer_department = result_department['answer'].lower()
+    ai_score_department = result_department['score']
+    print(f"AI Department Answer: {ai_answer_department}, Score: {ai_score_department}")
+
+    for dept in departments:
+        dept_lower = dept.lower()
+        # Only apply if the department is in the query OR the AI is very confident
+        if (dept_lower in question_lower and dept_lower in ai_answer_department) or (dept_lower in ai_answer_department and ai_score_department > 0.9):
+            department = db.query(Department).filter(Department.name.ilike(dept)).first()
+            if department:
+                filters["department_id"] = department.id
+                print(f"AI detected department: {dept} (ID: {department.id})")
+                break
+
+    # Step 3: Extract status
+    nlp_input_status = {
+        "question": f"What status is mentioned in this query: {question}",
+        "context": context_statuses
+    }
+    result_status = app.state.qa_pipeline(question=nlp_input_status["question"], context=nlp_input_status["context"])
+    ai_answer_status = result_status['answer'].lower()
+    ai_score_status = result_status['score']
+    print(f"AI Status Answer: {ai_answer_status}, Score: {ai_score_status}")
+
+    for status in statuses:
+        status_lower = status.lower()
+        # Only apply if the status is in the query OR the AI is very confident
+        if (status_lower in question_lower and status_lower in ai_answer_status) or (status_lower in ai_answer_status and ai_score_status > 0.9):
+            status_obj = db.query(Status).filter(Status.name.ilike(status)).first()
+            if status_obj:
+                filters["status_id"] = status_obj.id
+                print(f"AI detected status: {status} (ID: {status_obj.id})")
+                break
+
+    # Rule-based fallback for conditions
     condition_values = {
         "new": "New", 
         "good": "Good",
@@ -184,92 +251,21 @@ def analyze_query_intent(question, db: Session): #add db parameter
     for value, db_value in condition_values.items():
         if value in question_lower:
             filters["condition"] = db_value
-            print(f"Detected condition: {db_value}")
+            print(f"Rule-based detected condition: {db_value}")
     
-    # Check for status ID
+    # Rule-based status ID detection
     status_match = re.search(r'status\s+id\s+(\d+)', question_lower)
     if status_match:
         filters["status_id"] = int(status_match.group(1))
-        print(f"Detected status ID: {filters['status_id']}") 
+        print(f"Rule-based detected status ID: {filters['status_id']}")
 
-    # Extract filter values using more flexible patterns
-    for filter_type, keywords in filter_keywords.items():
-        # Skip condition and status_id since we handled them above
-        # if filter_type in filters or filter_type == "condition" or filter_type == "status":
-        #     continue
-        if filter_type in filters or filter_type in ["condition", "status", "location_id"]:
-            continue
-            
-        for keyword in keywords:
-            if keyword in question_lower:
-                # More flexible pattern matching
-                patterns = [
-                    # rf"{keyword}\s+(is|=|:|of|in|with)\s+(\w+)",  # keyword is/with value
-                    # rf"(\w+)\s+{keyword}",                       # value keyword
-                    # rf"{keyword}\s+(\w+)"                         # keyword value
-                    rf"{keyword}\s+(is|=|:|of|in|with)\s+(.+?)(?=\s*(with|in|from|$))",
-                    rf"(\w+)\s+{keyword}",
-                    rf"{keyword}\s+(.+?)(?=\s*(with|in|from|$))"
-                ]
-                
-                #OLD CODES
-                # for pattern in patterns:
-                #     matches = re.search(pattern, question_lower)
-                #     if matches:
-                #         if len(matches.groups()) == 2:
-                #             filters[filter_type] = matches.group(2).strip()
-                #         else:
-                #             filters[filter_type] = matches.group(1).strip() #ADDED STRIPS
-                #         break
-                
-                # # If no match but keyword exists, mark as true
-                # if keyword in question_lower and filter_type not in filters:
-                #     filters[filter_type] = True
-                
-                for pattern in patterns:
-                    matches = re.search(pattern, question_lower)
-                    if matches:
-                        if len(matches.groups()) == 2:
-                            value = matches.group(2).strip()
-                        else:
-                            value = matches.group(1).strip()
-                        if filter_type == "location":
-                            location = db.query(Location).filter(Location.name.ilike(value)).first()
-                            if location:
-                                filters["location_id"] = location.id
-                                print(f"Resolved location '{value}' to location_id: {location.id}")
-                            else:
-                                filters["location_id"] = None
-                        elif filter_type == "department":
-                            department = db.query(Department).filter(Department.name.ilike(value)).first()
-                            if department:
-                                filters["department_id"] = department.id
-                                print(f"Resolved department '{value}' to department_id: {department.id}")
-                            else:
-                                filters["department_id"] = None
-                        elif filter_type == "status":
-                            status = db.query(Status).filter(Status.name.ilike(value)).first()
-                            if status:
-                                filters["status_id"] = status.id
-                                print(f"Resolved status '{value}' to status_id: {status.id}")
-                            else:
-                                filters["status_id"] = None
-                        else:
-                            filters[filter_type] = value
-                        break
-                
-                if keyword in question_lower and filter_type not in filters:
-                    filters[filter_type] = True
-    
-    #Debug Output
-    print(f"Detected intent: {intent}")
-    print(f"Extracted filters: {filters}")
-    
-    # If no specific filters identified, treat as general query
+    # If no filters are found, fall back to general query
     if not filters:
         return "general_query", {}
     
+    print(f"Detected intent: {intent}, Extracted filters: {filters}")
     return intent, filters
+
 
 def handle_asset_tag_lookup(asset_tag, db):
     """Handle direct asset tag lookup"""
@@ -318,7 +314,7 @@ def handle_asset_filter_query(filters, db):
         query = query.filter(Asset.department_id == filters["department_id"])
         
     # Execute query and format results
-    assets = query.limit(5).all()  # Limit to 5 results
+    assets = query.all()  # Limit to 5 results
     print(f"Query returned {len(assets)} assets")
     
     if not assets:
