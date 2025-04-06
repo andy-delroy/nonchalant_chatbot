@@ -1,4 +1,4 @@
-#v1.4 (fix 14)
+#v1.5 (fix 15)
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.thismydb.database import SessionLocal, engine
