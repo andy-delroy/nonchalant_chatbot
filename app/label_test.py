@@ -1,6 +1,6 @@
 import json
 
-with open("ner_dataset.json", "r") as f:
+with open("ner_fresh_balanced_dataset.json", "r") as f:
     data = json.load(f)
 
 all_labels = set()

@@ -1,6 +1,6 @@
 import json
 
-with open("ner_dataset_new.json", "r") as f:
+with open("ner_fresh_balanced_dataset.json", "r") as f:
     data = json.load(f)
 
 print(type(data))  # Should print: <class 'list'>

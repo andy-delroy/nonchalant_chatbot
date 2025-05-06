@@ -47,6 +47,9 @@ bert-ner-finetuned/
 *.h5   # Keras model weights
 
 fine_tuned_ner/
+fine_tuned_ner_demo/
+fine_tuned_ner_v2/
+fine_tuned_ner_v3/
 
 results/
 

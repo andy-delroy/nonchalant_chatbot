@@ -6,7 +6,7 @@ from datasets import load_dataset
 import json
 
 # Verify JSON
-with open("ner_fresh_balanced_dataset.json", "r") as f:
+with open("ner_dataset_fixed.json", "r") as f:
     data = json.load(f)
     print(f"Loaded data type: {type(data)}, length: {len(data)}")
     print(f"First entry: {data[0]}")
@@ -22,7 +22,7 @@ model.config.id2label = {idx: label for idx, label in enumerate(labels)}
 print(f"Model num_labels: {model.config.num_labels}")
 
 # Load dataset without shuffling
-dataset = load_dataset("json", data_files="ner_fresh_balanced_dataset.json", split="train")
+dataset = load_dataset("json", data_files="ner_dataset_v2.json", split="train")
 dataset = dataset.train_test_split(test_size=0.2, shuffle=False)
 
 # Tokenize and align labels
@@ -95,8 +95,5 @@ trainer = Trainer(
 
 # Train and save
 trainer.train()
-model.save_pretrained("./fine_tuned_ner_v3")
-tokenizer.save_pretrained("./fine_tuned_ner_v3")
-
-
-# queen
+model.save_pretrained("./fine_tuned_ner_v2")
+tokenizer.save_pretrained("./fine_tuned_ner_v2")
