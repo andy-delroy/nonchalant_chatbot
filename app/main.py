@@ -1,17 +1,19 @@
-#v1.7 (fix 15) best-trained model withe existing data
+# LLM agent v1
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.thismydb.database import SessionLocal, engine
 from app.schemas.models import Asset, Location, Department, Status, User
-from app.schemas.models import Asset
 from transformers import pipeline
 from pydantic import BaseModel
 from app.utils.utils import extract_asset_tag
-# from .ml_model import nlp_model
 from fuzzywuzzy import process
 import re
 import os
+import json
+import ollama
 from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Optional
+import redis.asyncio as redis
 
 app = FastAPI()
 
@@ -22,10 +24,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# to display pretty in front end
-from typing import List, Optional
 
-# Create a new Pydantic model for asset results
+# Pydantic models for structured responses
 class AssetItem(BaseModel):
     id: int
     name: str
@@ -38,22 +38,18 @@ class AssetItem(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
+    mode: str = "ner"  # defaults to ner if unspecified
 
-# Adjust your QueryResponse to optionally include a list of assets
 class QueryResponse(BaseModel):
     answer: str
     assets: Optional[List[AssetItem]] = None
 
-#helper functions
+# Helper functions
 def suggest_similar_location(detected_name: str, db_names: list, threshold=70, limit=3):
-    """
-    Suggest similar location names based on fuzzy string matching.
-    """
     matches = process.extract(detected_name, db_names, limit=limit)
     suggestions = [name for name, score in matches if score >= threshold]
     return suggestions
 
-# Fixed get_db function that correctly yields a session
 def get_db():
     db = SessionLocal()
     try:
@@ -63,6 +59,7 @@ def get_db():
 
 @app.on_event("startup")
 async def startup_event():
+    # Load NER pipeline
     base_dir = os.path.dirname(os.path.abspath(__file__))
     model_path = os.path.join(base_dir, "fine_tuned_ner_v3")
     if not os.path.exists(model_path):
@@ -76,31 +73,140 @@ async def startup_event():
     app.state.ner_pipeline.model.eval()
     print(f"NER pipeline loaded from {model_path}")
 
+    # No need to load LLM locally; we'll use Ollama's API
+    print("Using Ollama's Mistral model via API")
+
+    r = redis.from_url("redis://localhost:6379", decode_responses=True)
+    print("this nigga should print...")
+    print(await r.ping())   # should print True
+
+
+async def call_llm_agent(question: str, db: Session):
+    """
+    Use Ollama's Mistral model to process the query and extract intent and filters.
+    Returns a dictionary with intent and filters to map to functions.
+    """
+    # Get possible values from the database for context
+    locations = [loc.name for loc in db.query(Location).all()]
+    departments = [dept.name for dept in db.query(Department).all()]
+    statuses = [status.name for status in db.query(Status).all()]
+    managers = [user.username for user in db.query(User).all()]
+
+    # Construct the prompt
+    prompt = f"""
+You are an AI agent for an asset management system. Your task is to analyze the user's query and extract the intent and filters to query a database. The system supports the following intents:
+- "asset_lookup_by_tag": Lookup an asset by its tag (a UUID, e.g., 123e4567-e89b-12d3-a456-426614174000).
+- "asset_filter": Filter assets by properties like location, status, department, condition, or manager.
+- "asset_count": Count assets matching certain properties.
+- "general_query": For queries that don't fit the above intents.
+
+Available locations: {', '.join(locations)}
+Available departments: {', '.join(departments)}
+Available statuses: {', '.join(statuses)}
+Available managers: {', '.join(managers)}
+Conditions: New, Good, Fair, Poor, Excellent
+
+For the query: "{question}"
+
+Return a JSON object with the following structure:
+- "intent": One of the supported intents.
+- "filters": A dictionary of filters (e.g., {{"location": "Warehouse", "status": "Available"}}). Use the exact names from the available options above. If an entity doesn't match any available option, include it as "unmatched_entity" with its type (e.g., {{"unmatched_entity": "Quantum Hub", "type": "location"}}).
+
+Example:
+Query: "Give me all the assets from Warehouse that are Available"
+Output: {{"intent": "asset_filter", "filters": {{"location": "Warehouse", "status": "Available"}}}}
+"""
+
+    # Call Ollama's Mistral API
+    response = ollama.generate(
+        model="mistral",
+        prompt=prompt,
+        options={"temperature": 0.1, "max_tokens": 150}
+    )
+    llm_output = response["response"]
+
+    # Extract JSON from the response (remove preamble like "Query: ... Output: ")
+    json_start = llm_output.find("{")
+    if json_start != -1:
+        json_str = llm_output[json_start:]
+        try:
+            result = json.loads(json_str)
+        except json.JSONDecodeError:
+            print(f"LLM response parsing failed: {llm_output}")
+            return {"intent": "general_query", "filters": {}}
+    else:
+        print(f"LLM response parsing failed: {llm_output}")
+        return {"intent": "general_query", "filters": {}}
+
+    intent = result.get("intent", "general_query")
+    filters = result.get("filters", {})
+
+    # Map entity names to database IDs
+    processed_filters = {}
+    if "location" in filters:
+        location_name = filters["location"]
+        location = db.query(Location).filter(Location.name.ilike(location_name)).first()
+        if location:
+            processed_filters["location_id"] = location.id
+        else:
+            suggestions = suggest_similar_location(location_name, locations)
+            return {"intent": "unresolved_location", "filters": {"suggestions": suggestions, "unmatched_location": location_name}}
+
+    if "status" in filters:
+        status_name = filters["status"]
+        status = db.query(Status).filter(Status.name.ilike(status_name)).first()
+        if status:
+            processed_filters["status_id"] = status.id
+
+    if "department" in filters:
+        dept_name = filters["department"]
+        department = db.query(Department).filter(Department.name.ilike(dept_name)).first()
+        if department:
+            processed_filters["department_id"] = department.id
+
+    if "manager" in filters:
+        manager_name = filters["manager"]
+        user = db.query(User).filter(User.username.ilike(manager_name)).first()
+        if user:
+            processed_filters["user_id"] = user.id
+
+    if "condition" in filters:
+        condition = filters["condition"]
+        if condition in ["New", "Good", "Fair", "Poor", "Excellent"]:
+            processed_filters["condition"] = condition
+
+    if "unmatched_entity" in filters:
+        return {"intent": "unresolved_location", "filters": {
+            "suggestions": suggest_similar_location(filters["unmatched_entity"], locations if filters.get("type") == "location" else []),
+            "unmatched_location": filters["unmatched_entity"]
+        }}
+
+    return {"intent": intent, "filters": processed_filters}
+
 @app.post("/query", response_model=QueryResponse)
 async def query_assets(request: QueryRequest, db: Session = Depends(get_db)):
     question = request.question
-    print(f"⭐💩 Processing question: {question}")
+    mode = request.mode.lower()
+    print(f"⭐💩 Processing question: {question} [mode: {mode}]")
     
-     # Check what assets are in the database
-    # sample_assets = db.query(Asset).limit(3).all()
-    # print("Sample assets in database:")
-    # for asset in sample_assets:
-    #     print(f"  - Name: {asset.name}, Condition: {asset.condition}, Status ID: {asset.status_id}")
-    
-    # Identify query intent and extract filters
-    #PASSING IN DB HERE
-    intent, filters = analyze_query_intent(question, db)
-    print(f"⭐ Intent: {intent}, Filters: {filters}")
+    # Check the preferred mode
+    if mode == "llm":
+        # Use the LLM agent with Ollama's Mistral
+        result = await call_llm_agent(question, db)
+        intent = result["intent"]
+        filters = result["filters"]
+        print(f"⭐ LLM Intent: {intent}, Filters: {filters}")
+    else:
+        # Use the NER pipeline (existing logic)
+        intent, filters = analyze_query_intent(question, db)
+        print(f"⭐ NER Intent: {intent}, Filters: {filters}")
     
     # Handle different query intents
     if intent == "asset_lookup_by_tag":
-        # Current logic for asset tag lookup
         return handle_asset_tag_lookup(filters.get("asset_tag"), db)
     elif intent == "asset_filter":
-        # New logic for filtered queries (condition, location, etc)
         return handle_asset_filter_query(filters, db)
     elif intent == "asset_count":
-        # Logic for counting assets
         return handle_asset_count_query(filters, db)
     elif intent == "unresolved_location":
         suggestions = filters.get("suggestions", [])
@@ -110,8 +216,7 @@ async def query_assets(request: QueryRequest, db: Session = Depends(get_db)):
             assets=[]
         )
     else:
-        return handle_general_query(question, db) 
-
+        return handle_general_query(question, db)
 
 # Test endpoint for joint queries
 @app.post("/test_joint_query", response_model=QueryResponse)
@@ -119,31 +224,22 @@ async def test_joint_query(request: QueryRequest, db: Session = Depends(get_db))
     question = request.question
     print(f"Testing joint query: {question}")
     
-    # # Example joint query: Get assets with their location, department, and status
-    # query = (db.query(Asset, Location, Department, Status)
-    #          .join(Location, Asset.location_id == Location.id)
-    #          .join(Department, Asset.department_id == Department.id)
-    #          .join(Status, Asset.status_id == Status.id))
-
-    # Use left outer joins for Department and Status to include assets with missing departments/statuses
     query = (db.query(Asset, Location, Department, Status)
              .join(Location, Asset.location_id == Location.id)
-             .outerjoin(Department, Asset.department_id == Department.id)  # Left join
-             .outerjoin(Status, Asset.status_id == Status.id))  # Left join
+             .outerjoin(Department, Asset.department_id == Department.id)
+             .outerjoin(Status, Asset.status_id == Status.id))
     
-    # Apply filters based on the question
-    if "branch office" in question.lower():
-        query = query.filter(Location.name.ilike("Branch Office"))
+    if "warehouse" in question.lower():
+        query = query.filter(Location.name.ilike("Warehouse"))
     if "it" in question.lower():
         query = query.filter(Department.name.ilike("IT"))
     if "available" in question.lower():
         query = query.filter(Status.name.ilike("Available"))
     
-    # results = query.limit(5).all()
     results = query.all()
     print(f"Query returned {len(results)} assets.🗣️🗣️🗣️🗣️")
     if not results:
-        return QueryResponse(answer="No assets found matching the test criteria.") 
+        return QueryResponse(answer="No assets found matching the test criteria.")
     
     result = "Found the following assets with joint table data:\n"
     for i, (asset, location, department, status) in enumerate(results, 1):
@@ -154,57 +250,38 @@ async def test_joint_query(request: QueryRequest, db: Session = Depends(get_db))
     
     return QueryResponse(answer=result)
 
-# Add a debug endpoint
+# Debug endpoint
 @app.post("/debug_query")
 async def debug_query(request: QueryRequest, db: Session = Depends(get_db)):
     question = request.question
-    
-    # Get all assets for context
     assets = db.query(Asset).all()
-    
-    # PRINTING FOR SAMPLE OUTPUT DEBUGGING
-    # print("Sample assets:")
-    # for asset in assets[:3]:
-    #     print(asset)
-    
-    # Create context
     context = " ".join([f"Asset: {asset.name}, Tag: {asset.asset_tag}, Serial: {asset.serial}" 
                        for asset in assets])
     
-    # Log what we're sending to the model
     print(f"Question: {question}")
     print(f"Number of assets in context: {len(assets)}")
-    print(f"Context sample: {context[:200]}...")  # Print first 200 chars
+    print(f"Context sample: {context[:200]}...")
     
-    # Process with QA pipeline
-    nlp_input = {"question": question, "context": context}
-    result = app.state.qa_pipeline(nlp_input)
-    
-    # Return detailed debug info
     return {
         "question": question,
         "num_assets": len(assets),
         "context_length": len(context),
-        "answer": result['answer'],
-        "score": result['score'],
-        "start": result.get('start', None),
-        "end": result.get('end', None)
+        "answer": "Debug endpoint not fully implemented (missing qa_pipeline).",
+        "score": 0.0,
+        "start": None,
+        "end": None
     }
-
-#Modify the function to use the DeepSeek model to extract entities (locations, departments, statuses) from the query, while keeping rule-based logic as a fallback
 
 def analyze_query_intent(question, db: Session):
     """Analyze the user's question using NER and rule-based approaches"""
     question_lower = question.lower()
     print(f"Analyzing intent for: {question_lower}")
 
-    # Check for direct asset tag lookup (rule-based)
     uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     found_tags = re.findall(uuid_pattern, question_lower)
     if found_tags:
         return "asset_lookup_by_tag", {"asset_tag": found_tags[0]}
 
-    # Define possible intents and filters
     filters = {}
     count_indicators = ["how many", "count", "total number", "number of"]
     if any(indicator in question_lower for indicator in count_indicators):
@@ -212,163 +289,14 @@ def analyze_query_intent(question, db: Session):
     else:
         intent = "asset_filter"
 
-    # Get possible values from the database
     locations = [loc.name for loc in db.query(Location).all()]
     departments = [dept.name for dept in db.query(Department).all()]
     statuses = [status.name for status in db.query(Status).all()]
-
-    # Use NER with original case for better recognition
-    entities = app.state.ner_pipeline(question)  # Pass original question, not lowercase
-    print(f"NER Entities: {entities}")
-
-    # Process NER output
-    current_entity = []
-    for entity in entities:
-        if entity["entity"].startswith("B-"):
-            if current_entity:  # Process previous entity
-                entity_text = " ".join(current_entity).replace(" ##", "")
-                label = entities[len(current_entity) - 1]["entity"].split("-")[1]
-                if label == "LOCATION":
-                    location_matches = process.extractOne(entity_text.lower(), [loc.lower() for loc in locations])
-                    if location_matches and location_matches[1] > 80:
-                        loc = next(l for l in locations if l.lower() == location_matches[0])
-                        location = db.query(Location).filter(Location.name.ilike(loc)).first()
-                        filters["location_id"] = location.id
-                        print(f"NER detected location: {loc} (ID: {location.id})")
-                elif label == "STATUS":
-                    status_matches = process.extractOne(entity_text.lower(), [s.lower() for s in statuses])
-                    if status_matches and status_matches[1] > 80:
-                        status = next(s for s in statuses if s.lower() == status_matches[0])
-                        status_obj = db.query(Status).filter(Status.name.ilike(status)).first()
-                        filters["status_id"] = status_obj.id
-                        print(f"NER detected status: {status} (ID: {status_obj.id})")
-                elif label == "DEPARTMENT":
-                    dept_matches = process.extractOne(entity_text.lower(), [d.lower() for d in departments])
-                    if dept_matches and dept_matches[1] > 80:
-                        dept = next(d for d in departments if d.lower() == dept_matches[0])
-                        department = db.query(Department).filter(Department.name.ilike(dept)).first()
-                        filters["department_id"] = department.id
-                        print(f"NER detected department: {dept} (ID: {department.id})")
-            current_entity = [entity["word"]]
-        elif entity["entity"].startswith("I-"):
-            current_entity.append(entity["word"])
-    if current_entity:  # Process last entity
-        entity_text = " ".join(current_entity).replace(" ##", "")
-        label = entities[-1]["entity"].split("-")[1]
-        if label == "LOCATION":
-            location_matches = process.extractOne(entity_text.lower(), [loc.lower() for loc in locations])
-            if location_matches and location_matches[1] > 80:
-                loc = next(l for l in locations if l.lower() == location_matches[0])
-                location = db.query(Location).filter(Location.name.ilike(loc)).first()
-                filters["location_id"] = location.id
-                print(f"NER detected location: {loc} (ID: {location.id})")
-        elif label == "STATUS":
-            status_matches = process.extractOne(entity_text.lower(), [s.lower() for s in statuses])
-            if status_matches and status_matches[1] > 80:
-                status = next(s for s in statuses if s.lower() == status_matches[0])
-                status_obj = db.query(Status).filter(Status.name.ilike(status)).first()
-                filters["status_id"] = status_obj.id
-                print(f"NER detected status: {status} (ID: {status_obj.id})")
-        elif label == "DEPARTMENT":
-            dept_matches = process.extractOne(entity_text.lower(), [d.lower() for d in departments])
-            if dept_matches and dept_matches[1] > 80:
-                dept = next(d for d in departments if d.lower() == dept_matches[0])
-                department = db.query(Department).filter(Department.name.ilike(dept)).first()
-                filters["department_id"] = department.id
-                print(f"NER detected department: {dept} (ID: {department.id})")
-
-    # Rule-based fallback
-    for status in statuses:
-        if status.lower() in question_lower and "status_id" not in filters:
-            status_obj = db.query(Status).filter(Status.name.ilike(status)).first()
-            filters["status_id"] = status_obj.id
-            print(f"Rule-based detected status: {status} (ID: {status_obj.id})")
-    for dept in departments:
-        if dept.lower() in question_lower and "department_id" not in filters:
-            department = db.query(Department).filter(Department.name.ilike(dept)).first()
-            filters["department_id"] = department.id
-            print(f"Rule-based detected department: {dept} (ID: {department.id})")
-    for loc in locations:
-        if loc.lower() in question_lower and "location_id" not in filters:
-            location = db.query(Location).filter(Location.name.ilike(loc)).first()
-            filters["location_id"] = location.id
-            print(f"Rule-based detected location: {loc} (ID: {location.id})")
-
-    condition_values = {"new": "New", "good": "Good", "fair": "Fair", "poor": "Poor", "excellent": "Excellent"}
-    for value, db_value in condition_values.items():
-        if value in question_lower:
-            filters["condition"] = db_value
-            print(f"Rule-based detected condition: {db_value}")
-
-    status_match = re.search(r'status\s+id\s+(\d+)', question_lower)
-    if status_match:
-        filters["status_id"] = int(status_match.group(1))
-        print(f"Rule-based detected status ID: {filters['status_id']}")
-    
-    # Look for unresolved NER LOCATION spans
-    location_spans = []
-    current_location = []
-
-    for entity in entities:
-        if entity["entity"].endswith("LOCATION"):
-            current_location.append(entity["word"])
-        else:
-            if current_location:
-                location_spans.append(" ".join(current_location).replace(" ##", ""))
-                current_location = []
-
-    # Append final if NER ends on a location
-    if current_location:
-        location_spans.append(" ".join(current_location).replace(" ##", ""))
-
-    # Try to resolve each detected LOCATION span
-    for span in location_spans:
-        if "location_id" not in filters:
-            match, score = process.extractOne(span.lower(), [loc.lower() for loc in locations])
-            if score >= 80:
-                # Still good — silently resolve
-                loc = next(l for l in locations if l.lower() == match)
-                location = db.query(Location).filter(Location.name.ilike(loc)).first()
-                filters["location_id"] = location.id
-                print(f"NER fuzzy matched location: {loc} (ID: {location.id})")
-            else:
-                suggestions = suggest_similar_location(span, locations)
-                if suggestions:
-                    print(f"❓ Unresolved location '{span}', did you mean: {suggestions}")
-                    return "unresolved_location", {
-                        "suggestions": suggestions,
-                        "unmatched_location": span
-                    }
-
-    # if not filters:
-    #     return "general_query", {}
-
-    print(f"Detected intent: {intent}, Extracted filters: {filters}")
-    return intent, filters
-
-# def analyze_query_intent(question, db: Session):
-    """Analyze the user's question using NER and rule-based approaches"""
-    question_lower = question.lower()
-    print(f"Analyzing intent for: {question_lower}")
-
-    # Check for direct asset tag lookup (rule-based)
-    uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    found_tags = re.findall(uuid_pattern, question_lower)
-    if found_tags:
-        return "asset_lookup_by_tag", {"asset_tag": found_tags[0]}
-
-    filters = {}
-    count_indicators = ["how many", "count", "total number", "number of"]
-    intent = "asset_count" if any(i in question_lower for i in count_indicators) else "asset_filter"
-
-    locations = [loc.name for loc in db.query(Location).all()]
-    departments = [dept.name for dept in db.query(Department).all()]
-    statuses = [status.name for status in db.query(Status).all()]
+    managers = [user.username for user in db.query(User).all()]
 
     entities = app.state.ner_pipeline(question)
     print(f"NER Entities: {entities}")
 
-    # Process NER into filters
     current_entity = []
     for entity in entities:
         if entity["entity"].startswith("B-"):
@@ -396,10 +324,16 @@ def analyze_query_intent(question, db: Session):
                         department = db.query(Department).filter(Department.name.ilike(dept)).first()
                         filters["department_id"] = department.id
                         print(f"NER detected department: {dept} (ID: {department.id})")
+                elif label == "MANAGER":
+                    manager_matches = process.extractOne(entity_text.lower(), [m.lower() for m in managers])
+                    if manager_matches and manager_matches[1] > 80:
+                        manager = next(m for m in managers if m.lower() == manager_matches[0])
+                        user = db.query(User).filter(User.username.ilike(manager)).first()
+                        filters["user_id"] = user.id
+                        print(f"NER detected manager: {manager} (ID: {user.id})")
             current_entity = [entity["word"]]
         elif entity["entity"].startswith("I-"):
             current_entity.append(entity["word"])
-
     if current_entity:
         entity_text = " ".join(current_entity).replace(" ##", "")
         label = entities[-1]["entity"].split("-")[1]
@@ -424,25 +358,35 @@ def analyze_query_intent(question, db: Session):
                 department = db.query(Department).filter(Department.name.ilike(dept)).first()
                 filters["department_id"] = department.id
                 print(f"NER detected department: {dept} (ID: {department.id})")
+        elif label == "MANAGER":
+            manager_matches = process.extractOne(entity_text.lower(), [m.lower() for m in managers])
+            if manager_matches and manager_matches[1] > 80:
+                manager = next(m for m in managers if m.lower() == manager_matches[0])
+                user = db.query(User).filter(User.username.ilike(manager)).first()
+                filters["user_id"] = user.id
+                print(f"NER detected manager: {manager} (ID: {user.id})")
 
-    # Rule-based fallbacks
+    # Rule-based fallback
     for status in statuses:
         if status.lower() in question_lower and "status_id" not in filters:
             status_obj = db.query(Status).filter(Status.name.ilike(status)).first()
             filters["status_id"] = status_obj.id
             print(f"Rule-based detected status: {status} (ID: {status_obj.id})")
-
     for dept in departments:
         if dept.lower() in question_lower and "department_id" not in filters:
             department = db.query(Department).filter(Department.name.ilike(dept)).first()
             filters["department_id"] = department.id
             print(f"Rule-based detected department: {dept} (ID: {department.id})")
-
     for loc in locations:
         if loc.lower() in question_lower and "location_id" not in filters:
             location = db.query(Location).filter(Location.name.ilike(loc)).first()
             filters["location_id"] = location.id
             print(f"Rule-based detected location: {loc} (ID: {location.id})")
+    for manager in managers:
+        if manager.lower() in question_lower and "user_id" not in filters:
+            user = db.query(User).filter(User.username.ilike(manager)).first()
+            filters["user_id"] = user.id
+            print(f"Rule-based detected manager: {manager} (ID: {user.id})")
 
     condition_values = {"new": "New", "good": "Good", "fair": "Fair", "poor": "Poor", "excellent": "Excellent"}
     for value, db_value in condition_values.items():
@@ -450,10 +394,13 @@ def analyze_query_intent(question, db: Session):
             filters["condition"] = db_value
             print(f"Rule-based detected condition: {db_value}")
 
-    # Check for unresolved NER locations and suggest alternatives
+    status_match = re.search(r'status\s+id\s+(\d+)', question_lower)
+    if status_match:
+        filters["status_id"] = int(status_match.group(1))
+        print(f"Rule-based detected status ID: {filters['status_id']}")
+
     location_spans = []
     current_location = []
-
     for entity in entities:
         if entity["entity"].endswith("LOCATION"):
             current_location.append(entity["word"])
@@ -461,19 +408,17 @@ def analyze_query_intent(question, db: Session):
             if current_location:
                 location_spans.append(" ".join(current_location).replace(" ##", ""))
                 current_location = []
-
     if current_location:
         location_spans.append(" ".join(current_location).replace(" ##", ""))
 
-    if intent == "asset_filter" and not filters and location_spans:
-        for span in location_spans:
+    for span in location_spans:
+        if "location_id" not in filters:
             match, score = process.extractOne(span.lower(), [loc.lower() for loc in locations])
             if score >= 80:
                 loc = next(l for l in locations if l.lower() == match)
                 location = db.query(Location).filter(Location.name.ilike(loc)).first()
                 filters["location_id"] = location.id
-                print(f"Fallback fuzzy matched location: {loc} (ID: {location.id})")
-                return intent, filters
+                print(f"NER fuzzy matched location: {loc} (ID: {location.id})")
             else:
                 suggestions = suggest_similar_location(span, locations)
                 if suggestions:
@@ -483,9 +428,6 @@ def analyze_query_intent(question, db: Session):
                         "unmatched_location": span
                     }
 
-    if not filters:
-        return "general_query", {}
-
     print(f"Detected intent: {intent}, Extracted filters: {filters}")
     return intent, filters
 
@@ -494,7 +436,6 @@ def handle_general_query(question, db):
     query = db.query(Asset)
     question_lower = question.lower()
 
-    # Simple rule-based extraction for general queries
     locations = [loc.name for loc in db.query(Location).all()]
     for loc in locations:
         if loc.lower() in question_lower:
@@ -503,11 +444,18 @@ def handle_general_query(question, db):
             print(f"General query filter - Location: {loc} (ID: {location.id})")
             break
 
+    statuses = [status.name for status in db.query(Status).all()]
+    for status in statuses:
+        if status.lower() in question_lower:
+            status_obj = db.query(Status).filter(Status.name.ilike(status)).first()
+            query = query.filter(Asset.status_id == status_obj.id)
+            print(f"General query filter - Status: {status} (ID: {status_obj.id})")
+            break
+
     assets = query.all()
     if not assets:
         return QueryResponse(answer="No assets found matching your query.")
     
-    # Create text response
     result = "Found the following assets general:\n"
     for i, asset in enumerate(assets, 1):
         result += f"{i}. Asset: {asset.name}, Tag: {asset.asset_tag}"
@@ -522,14 +470,17 @@ def handle_general_query(question, db):
         if asset.department_id:
             department = db.query(Department).filter(Department.id == asset.department_id).first()
             result += f", Department: {department.name if department else 'None'}"
+        if asset.user_id:
+            user = db.query(User).filter(User.id == asset.user_id).first()
+            result += f", Managed by: {user.username if user else 'None'}"
         result += "\n"
     
-    # Build structured asset data
     asset_items = []
     for asset in assets:
         status_obj = db.query(Status).get(asset.status_id) if asset.status_id else None
         location_obj = db.query(Location).get(asset.location_id) if asset.location_id else None
         department_obj = db.query(Department).get(asset.department_id) if asset.department_id else None
+        user_obj = db.query(User).get(asset.user_id) if asset.user_id else None
         
         asset_items.append(AssetItem(
             id=asset.id,
@@ -543,8 +494,6 @@ def handle_general_query(question, db):
         ))
     
     print("called General")
-    
-    # Return both text and structured data
     return QueryResponse(answer=result.strip(), assets=asset_items)
 
 def handle_asset_tag_lookup(asset_tag, db):
@@ -555,13 +504,11 @@ def handle_asset_tag_lookup(asset_tag, db):
     
     return QueryResponse(answer=f"Asset Name: {asset.name}, Tag: {asset.asset_tag}, Serial: {asset.serial}, Purchase Date: {asset.purchase_date}")
 
-# Modify this function to consistently return both text and structured asset data
 def handle_asset_filter_query(filters, db):
     """Handle queries that filter assets by properties"""
     query = db.query(Asset)
     print(f"Applying filters: {filters}")
     
-    # Apply filters
     if "condition" in filters and filters["condition"] is not True:
         print(f"Filtering by condition: {filters['condition']}")
         query = query.filter(Asset.condition == filters["condition"])
@@ -581,23 +528,25 @@ def handle_asset_filter_query(filters, db):
             return QueryResponse(answer="Department not found in the database.")
         print(f"Filtering by department_id: {filters['department_id']}")
         query = query.filter(Asset.department_id == filters["department_id"])
+    
+    if "user_id" in filters:
+        print(f"Filtering by user_id: {filters['user_id']}")
+        query = query.filter(Asset.user_id == filters["user_id"])
         
-    # Execute query and format results
     assets = query.all()
     print(f"Query returned {len(assets)} assets")
     
     if not assets:
         return QueryResponse(answer="No assets found matching your criteria.")
     
-    # Create a text summary
     result = f"Found {len(assets)} assets matching your criteria."
     
-    # Build a list of AssetItem objects with complete information
     asset_items = []
     for asset in assets:
         status_obj = db.query(Status).get(asset.status_id) if asset.status_id else None
         location_obj = db.query(Location).get(asset.location_id) if asset.location_id else None
         department_obj = db.query(Department).get(asset.department_id) if asset.department_id else None
+        user_obj = db.query(User).get(asset.user_id) if asset.user_id else None
         
         asset_items.append(AssetItem(
             id=asset.id,
@@ -611,14 +560,12 @@ def handle_asset_filter_query(filters, db):
         ))
     
     print("called filter")
-    # Always return both the text answer and structured asset data
     return QueryResponse(answer=result, assets=asset_items)
 
 def handle_asset_count_query(filters, db):
     """Handle queries that count assets with certain properties"""
     query = db.query(Asset)
     
-    # Apply the same filters as in handle_asset_filter_query
     if "condition" in filters and filters["condition"] is not True:
         query = query.filter(Asset.condition.ilike(f"%{filters['condition']}%"))
 
@@ -631,7 +578,8 @@ def handle_asset_count_query(filters, db):
     if "status_id" in filters and filters["status_id"] is not None:
         query = query.filter(Asset.status_id == filters["status_id"])
     
-    # Apply other filters...
+    if "user_id" in filters and filters["user_id"] is not None:
+        query = query.filter(Asset.user_id == filters["user_id"])
     
     count = query.count()
     
@@ -640,41 +588,3 @@ def handle_asset_count_query(filters, db):
         return QueryResponse(answer=f"Found {count} assets matching criteria: {filter_desc}")
     else:
         return QueryResponse(answer=f"Total number of assets: {count}")
-
-# def handle_general_query(question, db):
-#     """Handle general questions about assets"""
-#     # For this, we can use the QA pipeline as before
-#     context = " ".join([f"Asset: {asset.name}, Tag: {asset.asset_tag}, Serial: {asset.serial}, Condition: {asset.condition}" 
-#                       for asset in db.query(Asset).limit(50).all()])
-    
-#     nlp_input = {"question": question, "context": context}
-#     result = app.state.qa_pipeline(nlp_input)
-    
-#     return QueryResponse(answer=result['answer'])
-
-def extract_filters_from_question(question):
-    """Extract various filters from a natural language question"""
-    filters = {}
-    
-    # Condition detection
-    conditions = ["new", "good", "fair", "poor", "excellent"]
-    for condition in conditions:
-        if condition in question.lower():
-            filters["condition"] = condition.capitalize()
-            break
-    
-    # Status ID detection
-    import re
-    status_match = re.search(r'status\s+id\s+(\d+)', question.lower())
-    if status_match:
-        filters["status_id"] = int(status_match.group(1))
-    
-    # Date detection - purchase date before/after
-    date_after = re.search(r'(purchased|bought)\s+(after|since)\s+(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}|\d{4})', question.lower())
-    if date_after:
-        # Parse the date string and add to filters
-        filters["purchase_date_after"] = date_after.group(3)
-    
-    # More filter extraction logic...
-    
-    return filters
