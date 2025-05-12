@@ -1,5 +1,6 @@
 # LLM agent v1
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, Request, HTTPException
+from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy.orm import Session
 from app.thismydb.database import SessionLocal, engine
 from app.schemas.models import Asset, Location, Department, Status, User
@@ -7,16 +8,34 @@ from transformers import pipeline
 from pydantic import BaseModel
 from app.utils.utils import extract_asset_tag
 from fuzzywuzzy import process
-import re
+import re, textwrap
 import os
 import json
 import ollama
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
-import redis.asyncio as redis
+from redis.asyncio import Redis
+from typing import List, Optional, Dict
+
+def _first_json_block(text: str) -> str | None:
+    """Return the first {...}-balanced JSON chunk inside `text`, or None."""
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i        # mark the first opening brace
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start : i + 1]        # inclusive slice
+    return None
+
 
 app = FastAPI()
 
+# Session Middleware with secret key
+app.add_middleware(SessionMiddleware, secret_key=os.environ.get("SESSION_KEY", "your-secret-key-here"))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,31 +44,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models for structured responses
-class AssetItem(BaseModel):
-    id: int
-    name: str
-    tag: str
-    condition: Optional[str] = None
-    status_id: Optional[int] = None
-    status_name: Optional[str] = None
-    location_name: Optional[str] = None
-    department_name: Optional[str] = None
+# Redis setup with redis.asyncio
+REDIS     = Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"),
+                           decode_responses=True)
+CTX_TTL   = 900  # seconds
 
-class QueryRequest(BaseModel):
-    question: str
-    mode: str = "ner"  # defaults to ner if unspecified
+async def get_context(request: Request) -> Dict:
+    sid = request.session.setdefault("sid", os.urandom(8).hex())
+    key = f"ctx:{sid}"
+    data = await REDIS.get(key)
+    ctx  = json.loads(data) if data else {}
 
-class QueryResponse(BaseModel):
-    answer: str
-    assets: Optional[List[AssetItem]] = None
+    # 👀 DEBUG (remove later)
+    print(f"[CTX] sid={sid}  loaded={ctx}")
+    return ctx
 
-# Helper functions
-def suggest_similar_location(detected_name: str, db_names: list, threshold=70, limit=3):
-    matches = process.extract(detected_name, db_names, limit=limit)
-    suggestions = [name for name, score in matches if score >= threshold]
-    return suggestions
 
+async def save_context(request: Request, ctx: Dict):
+    await REDIS.setex(f"ctx:{request.session['sid']}", CTX_TTL, json.dumps(ctx))
+
+# Database dependency
 def get_db():
     db = SessionLocal()
     try:
@@ -59,7 +73,6 @@ def get_db():
 
 @app.on_event("startup")
 async def startup_event():
-    # Load NER pipeline
     base_dir = os.path.dirname(os.path.abspath(__file__))
     model_path = os.path.join(base_dir, "fine_tuned_ner_v3")
     if not os.path.exists(model_path):
@@ -72,208 +85,125 @@ async def startup_event():
     )
     app.state.ner_pipeline.model.eval()
     print(f"NER pipeline loaded from {model_path}")
-
-    # No need to load LLM locally; we'll use Ollama's API
     print("Using Ollama's Mistral model via API")
 
-    r = redis.from_url("redis://localhost:6379", decode_responses=True)
-    print("this nigga should print...")
-    print(await r.ping())   # should print True
+#utils
+def merge_filters(prev: Dict, new: Dict) -> Dict:
+    out = prev.copy()
+    out.update({k: v for k, v in new.items() if v is not None})
+    return out
 
+def suggest_similar_location(name: str, all_names: List[str], threshold=70, limit=3):
+    return [n for n, s in process.extract(name, all_names, limit=limit) if s >= threshold]
 
-async def call_llm_agent(question: str, db: Session):
-    """
-    Use Ollama's Mistral model to process the query and extract intent and filters.
-    Returns a dictionary with intent and filters to map to functions.
-    """
-    # Get possible values from the database for context
-    locations = [loc.name for loc in db.query(Location).all()]
-    departments = [dept.name for dept in db.query(Department).all()]
-    statuses = [status.name for status in db.query(Status).all()]
-    managers = [user.username for user in db.query(User).all()]
+# Pydantic models
+class AssetItem(BaseModel):
+    id: int
+    name: str
+    tag: str
+    condition: Optional[str] = None
+    status_id: Optional[int] = None
+    status_name: Optional[str] = None
+    location_name: Optional[str] = None
+    department_name: Optional[str] = None
 
-    # Construct the prompt
+class QueryRequest(BaseModel):
+    question: str
+    mode: str = "ner"
+
+class QueryResponse(BaseModel):
+    answer: str
+    assets: Optional[List[AssetItem]] = None
+    checkout_url: Optional[str] = None
+
+async def call_llm_agent(question: str, db: Session, context: Dict):
+    print(f"[LLM]  previous_filters seen by the LLM = {context.get('filters')}")
+    locations   = [l.name for l in db.query(Location).all()]
+    departments = [d.name for d in db.query(Department).all()]
+    statuses    = [s.name for s in db.query(Status).all()]
+    managers    = [u.username for u in db.query(User).all()]
+
     prompt = f"""
-You are an AI agent for an asset management system. Your task is to analyze the user's query and extract the intent and filters to query a database. The system supports the following intents:
-- "asset_lookup_by_tag": Lookup an asset by its tag (a UUID, e.g., 123e4567-e89b-12d3-a456-426614174000).
-- "asset_filter": Filter assets by properties like location, status, department, condition, or manager.
-- "asset_count": Count assets matching certain properties.
-- "general_query": For queries that don't fit the above intents.
+You are an AI agent for an asset-tracking system. For the user query below, return a JSON like
+{{"intent":"asset_filter","filters":{{"location":"Warehouse","status":"Available"}}}}.
+If it's a follow-up and the user omits location, reuse location from previous context.
 
-Available locations: {', '.join(locations)}
-Available departments: {', '.join(departments)}
-Available statuses: {', '.join(statuses)}
-Available managers: {', '.join(managers)}
-Conditions: New, Good, Fair, Poor, Excellent
+The system supports the following intents:
+- "asset_lookup_by_tag"
+- "asset_filter"
+- "asset_count"
+- "asset_checkout"  
+- "general_query"
 
-For the query: "{question}"
+Previous context filters: {context.get("filters", {})}
 
-Return a JSON object with the following structure:
-- "intent": One of the supported intents.
-- "filters": A dictionary of filters (e.g., {{"location": "Warehouse", "status": "Available"}}). Use the exact names from the available options above. If an entity doesn't match any available option, include it as "unmatched_entity" with its type (e.g., {{"unmatched_entity": "Quantum Hub", "type": "location"}}).
-
-Example:
-Query: "Give me all the assets from Warehouse that are Available"
-Output: {{"intent": "asset_filter", "filters": {{"location": "Warehouse", "status": "Available"}}}}
+Query: "{question}"
 """
+    llm_raw = ollama.generate("mistral", prompt, options={"temperature": 0.1, "max_tokens": 150})["response"]
+    json_chunk = _first_json_block(llm_raw)
 
-    # Call Ollama's Mistral API
-    response = ollama.generate(
-        model="mistral",
-        prompt=prompt,
-        options={"temperature": 0.1, "max_tokens": 150}
-    )
-    llm_output = response["response"]
-
-    # Extract JSON from the response (remove preamble like "Query: ... Output: ")
-    json_start = llm_output.find("{")
-    if json_start != -1:
-        json_str = llm_output[json_start:]
-        try:
-            result = json.loads(json_str)
-        except json.JSONDecodeError:
-            print(f"LLM response parsing failed: {llm_output}")
-            return {"intent": "general_query", "filters": {}}
-    else:
-        print(f"LLM response parsing failed: {llm_output}")
+    if json_chunk is None:
+        print("LLM returned no brace-balanced JSON – defaulting to general_query")
         return {"intent": "general_query", "filters": {}}
 
-    intent = result.get("intent", "general_query")
-    filters = result.get("filters", {})
+    # remove // comments that Mistral sometimes adds
+    json_chunk = re.sub(r"//.*", "", json_chunk)
 
-    # Map entity names to database IDs
-    processed_filters = {}
-    if "location" in filters:
-        location_name = filters["location"]
-        location = db.query(Location).filter(Location.name.ilike(location_name)).first()
-        if location:
-            processed_filters["location_id"] = location.id
+    try:
+        result = json.loads(json_chunk)
+    except json.JSONDecodeError as e:
+        print("LLM JSON parse failed:", e)
+        return {"intent": "general_query", "filters": {}}
+
+    intent   = result.get("intent", "general_query")
+    filters  = result.get("filters", {})
+    pfilters = {}  # processed
+
+    # ---- location id / name handling (bullet-proof) ----
+    if "location_id" in filters and isinstance(filters["location_id"], int):
+        pfilters["location_id"] = filters["location_id"]
+
+    elif "location" in filters:
+        loc_val = filters["location"]
+        if isinstance(loc_val, int):
+            pfilters["location_id"] = loc_val
+        elif isinstance(loc_val, str) and loc_val.isdigit():
+            pfilters["location_id"] = int(loc_val)
         else:
-            suggestions = suggest_similar_location(location_name, locations)
-            return {"intent": "unresolved_location", "filters": {"suggestions": suggestions, "unmatched_location": location_name}}
+            loc_obj = db.query(Location).filter(Location.name.ilike(loc_val)).first()
+            if loc_obj:
+                pfilters["location_id"] = loc_obj.id
+            else:
+                return {"intent": "unresolved_location",
+                        "filters": {"suggestions": suggest_similar_location(loc_val, locations),
+                                    "unmatched_location": loc_val}}
 
+    # ---- other filters ----
     if "status" in filters:
-        status_name = filters["status"]
-        status = db.query(Status).filter(Status.name.ilike(status_name)).first()
-        if status:
-            processed_filters["status_id"] = status.id
-
+        stat = db.query(Status).filter(Status.name.ilike(filters["status"])).first()
+        if stat:
+            pfilters["status_id"] = stat.id
     if "department" in filters:
-        dept_name = filters["department"]
-        department = db.query(Department).filter(Department.name.ilike(dept_name)).first()
-        if department:
-            processed_filters["department_id"] = department.id
-
+        dept = db.query(Department).filter(Department.name.ilike(filters["department"])).first()
+        if dept:
+            pfilters["department_id"] = dept.id
     if "manager" in filters:
-        manager_name = filters["manager"]
-        user = db.query(User).filter(User.username.ilike(manager_name)).first()
-        if user:
-            processed_filters["user_id"] = user.id
-
+        usr = db.query(User).filter(User.username.ilike(filters["manager"])).first()
+        if usr:
+            pfilters["user_id"] = usr.id
     if "condition" in filters:
-        condition = filters["condition"]
-        if condition in ["New", "Good", "Fair", "Poor", "Excellent"]:
-            processed_filters["condition"] = condition
+        pfilters["condition"] = filters["condition"]
 
-    if "unmatched_entity" in filters:
-        return {"intent": "unresolved_location", "filters": {
-            "suggestions": suggest_similar_location(filters["unmatched_entity"], locations if filters.get("type") == "location" else []),
-            "unmatched_location": filters["unmatched_entity"]
-        }}
+    # ---- follow-up location reuse ----
+    if (intent == "asset_filter"
+        and "location_id" not in pfilters
+        and "location_id" in context.get("filters", {})
+        and any(kw in question.lower() for kw in ["only the", "available ones", "ones"])):
+        pfilters["location_id"] = context["filters"]["location_id"]
 
-    return {"intent": intent, "filters": processed_filters}
+    return {"intent": intent, "filters": pfilters}
 
-@app.post("/query", response_model=QueryResponse)
-async def query_assets(request: QueryRequest, db: Session = Depends(get_db)):
-    question = request.question
-    mode = request.mode.lower()
-    print(f"⭐💩 Processing question: {question} [mode: {mode}]")
-    
-    # Check the preferred mode
-    if mode == "llm":
-        # Use the LLM agent with Ollama's Mistral
-        result = await call_llm_agent(question, db)
-        intent = result["intent"]
-        filters = result["filters"]
-        print(f"⭐ LLM Intent: {intent}, Filters: {filters}")
-    else:
-        # Use the NER pipeline (existing logic)
-        intent, filters = analyze_query_intent(question, db)
-        print(f"⭐ NER Intent: {intent}, Filters: {filters}")
-    
-    # Handle different query intents
-    if intent == "asset_lookup_by_tag":
-        return handle_asset_tag_lookup(filters.get("asset_tag"), db)
-    elif intent == "asset_filter":
-        return handle_asset_filter_query(filters, db)
-    elif intent == "asset_count":
-        return handle_asset_count_query(filters, db)
-    elif intent == "unresolved_location":
-        suggestions = filters.get("suggestions", [])
-        unmatched = filters.get("unmatched_location", "that location")
-        return QueryResponse(
-            answer=f"I couldn't find '{unmatched}' as a valid location in the system. Did you mean: {', '.join(suggestions)}?",
-            assets=[]
-        )
-    else:
-        return handle_general_query(question, db)
-
-# Test endpoint for joint queries
-@app.post("/test_joint_query", response_model=QueryResponse)
-async def test_joint_query(request: QueryRequest, db: Session = Depends(get_db)):
-    question = request.question
-    print(f"Testing joint query: {question}")
-    
-    query = (db.query(Asset, Location, Department, Status)
-             .join(Location, Asset.location_id == Location.id)
-             .outerjoin(Department, Asset.department_id == Department.id)
-             .outerjoin(Status, Asset.status_id == Status.id))
-    
-    if "warehouse" in question.lower():
-        query = query.filter(Location.name.ilike("Warehouse"))
-    if "it" in question.lower():
-        query = query.filter(Department.name.ilike("IT"))
-    if "available" in question.lower():
-        query = query.filter(Status.name.ilike("Available"))
-    
-    results = query.all()
-    print(f"Query returned {len(results)} assets.🗣️🗣️🗣️🗣️")
-    if not results:
-        return QueryResponse(answer="No assets found matching the test criteria.")
-    
-    result = "Found the following assets with joint table data:\n"
-    for i, (asset, location, department, status) in enumerate(results, 1):
-        result += (f"{i}. Asset: {asset.name}, Tag: {asset.asset_tag}, "
-                   f"Location: {location.name}, "
-                   f"Department: {department.name if department else 'None'}, "
-                   f"Status: {status.name if status else 'None'}\n")
-    
-    return QueryResponse(answer=result)
-
-# Debug endpoint
-@app.post("/debug_query")
-async def debug_query(request: QueryRequest, db: Session = Depends(get_db)):
-    question = request.question
-    assets = db.query(Asset).all()
-    context = " ".join([f"Asset: {asset.name}, Tag: {asset.asset_tag}, Serial: {asset.serial}" 
-                       for asset in assets])
-    
-    print(f"Question: {question}")
-    print(f"Number of assets in context: {len(assets)}")
-    print(f"Context sample: {context[:200]}...")
-    
-    return {
-        "question": question,
-        "num_assets": len(assets),
-        "context_length": len(context),
-        "answer": "Debug endpoint not fully implemented (missing qa_pipeline).",
-        "score": 0.0,
-        "start": None,
-        "end": None
-    }
-
-def analyze_query_intent(question, db: Session):
-    """Analyze the user's question using NER and rule-based approaches"""
+def analyze_query_intent(question, db: Session, context: dict):
     question_lower = question.lower()
     print(f"Analyzing intent for: {question_lower}")
 
@@ -288,6 +218,10 @@ def analyze_query_intent(question, db: Session):
         intent = "asset_count"
     else:
         intent = "asset_filter"
+
+    checkout_indicators = ["check out", "checkout", "check-out"]
+    if any(ci in question_lower for ci in checkout_indicators):
+        intent = "asset_checkout"
 
     locations = [loc.name for loc in db.query(Location).all()]
     departments = [dept.name for dept in db.query(Department).all()]
@@ -366,7 +300,6 @@ def analyze_query_intent(question, db: Session):
                 filters["user_id"] = user.id
                 print(f"NER detected manager: {manager} (ID: {user.id})")
 
-    # Rule-based fallback
     for status in statuses:
         if status.lower() in question_lower and "status_id" not in filters:
             status_obj = db.query(Status).filter(Status.name.ilike(status)).first()
@@ -428,11 +361,135 @@ def analyze_query_intent(question, db: Session):
                         "unmatched_location": span
                     }
 
+    # Merge with previous context
+    filters = merge_filters(context.get("filters", {}), filters)
+    if intent == "asset_filter" and "location_id" not in filters and "location_id" in context.get("filters", {}):
+        if "only the available ones" in question.lower() or "available ones" in question.lower():
+            filters["location_id"] = context["filters"]["location_id"]
+            print(f"Reused location_id {filters['location_id']} from previous context")
+
     print(f"Detected intent: {intent}, Extracted filters: {filters}")
     return intent, filters
 
+@app.post("/query", response_model=QueryResponse)
+async def query_assets(
+    request: Request,
+    db: Session = Depends(get_db),
+    context: dict = Depends(get_context)
+):
+    body = await request.json()
+    question = body.get("question")
+    mode = body.get("mode", "ner").lower()
+    print(f"⭐💩 Processing question: {question} [mode: {mode}]")
+
+    # ---------- 1. figure out intent & filters ----------
+    if mode == "llm":
+        result   = await call_llm_agent(question, db, context)
+        intent   = result["intent"]
+        filters  = result["filters"]
+        print(f"⭐ LLM Intent: {intent}, Filters: {filters}")
+    else:
+        intent, filters = analyze_query_intent(question, db, context)
+        print(f"⭐ NER Intent: {intent}, Filters: {filters}")
+
+    # ---------- 2. run the proper handler & get a resp ----------
+    if intent == "asset_lookup_by_tag":
+        resp = handle_asset_tag_lookup(filters.get("asset_tag"), db)
+    elif intent == "asset_filter":
+        resp = handle_asset_filter_query(filters, db)
+    elif intent == "asset_count":
+        resp = handle_asset_count_query(filters, db)
+    elif intent == "asset_checkout":
+        resp = handle_asset_checkout(filters, context, db) # new
+    elif intent == "unresolved_location":
+        suggestions = filters.get("suggestions", [])
+        unmatched   = filters.get("unmatched_location", "that location")
+        resp = QueryResponse(
+            answer=f"I couldn't find '{unmatched}' as a valid location in the system. "
+                   f"Did you mean: {', '.join(suggestions)}?",
+            assets=[]
+        )
+    else:
+        resp = handle_general_query(question, db)
+
+    # ---------- 3.  ▓ stash single-asset context  ▓ ----------
+    if intent in ["asset_filter", "general_query"] and len(getattr(resp, "assets", [])) == 1:
+        asset_id = resp.assets[0].id
+        context["last_asset_id"] = asset_id      # remember for follow-ups
+        filters["asset_id"]      = asset_id      # so checkout handler can reuse it
+
+    # ---------- 4. persist the (possibly updated) context ----------
+    await save_context(request, {
+        "filters"        : filters,
+        "last_asset_id"  : context.get("last_asset_id")
+    })
+
+    # ---------- 5. return ----------
+    return resp
+
+
+# Test endpoint for joint queries
+@app.post("/test_joint_query", response_model=QueryResponse)
+async def test_joint_query(request: Request, db: Session = Depends(get_db), context: dict = Depends(get_context)):
+    body = await request.json()  # Await the JSON body
+    question = body.get("question")
+    print(f"Testing joint query: {question}")
+    
+    query = (db.query(Asset, Location, Department, Status)
+             .join(Location, Asset.location_id == Location.id)
+             .outerjoin(Department, Asset.department_id == Department.id)
+             .outerjoin(Status, Asset.status_id == Status.id))
+    
+    if "warehouse" in question.lower():
+        query = query.filter(Location.name.ilike("Warehouse"))
+    if "it" in question.lower():
+        query = query.filter(Department.name.ilike("IT"))
+    if "available" in question.lower():
+        query = query.filter(Status.name.ilike("Available"))
+    
+    results = query.all()
+    print(f"Query returned {len(results)} assets.🗣️🗣️🗣️🗣️")
+    if not results:
+        return QueryResponse(answer="No assets found matching the test criteria.")
+    
+    result = "Found the following assets with joint table data:\n"
+    for i, (asset, location, department, status) in enumerate(results, 1):
+        result += (f"{i}. Asset: {asset.name}, Tag: {asset.asset_tag}, "
+                   f"Location: {location.name}, "
+                   f"Department: {department.name if department else 'None'}, "
+                   f"Status: {status.name if status else 'None'}\n")
+    
+    return QueryResponse(answer=result)
+
+# Debug endpoint
+@app.post("/debug_query")
+async def debug_query(request: Request, db: Session = Depends(get_db), context: dict = Depends(get_context)):
+    body = await request.json()  # Await the JSON body
+    question = body.get("question")
+    assets = db.query(Asset).all()
+    context = " ".join([f"Asset: {asset.name}, Tag: {asset.asset_tag}, Serial: {asset.serial}" 
+                       for asset in assets])
+    
+    print(f"Question: {question}")
+    print(f"Number of assets in context: {len(assets)}")
+    print(f"Context sample: {context[:200]}...")
+    
+    return {
+        "question": question,
+        "num_assets": len(assets),
+        "context_length": len(context),
+        "answer": "Debug endpoint not fully implemented (missing qa_pipeline).",
+        "score": 0.0,
+        "start": None,
+        "end": None
+    }
+
+def suggest_similar_location(detected_name: str, db_names: list, threshold=70, limit=3):
+    matches = process.extract(detected_name, db_names, limit=limit)
+    suggestions = [name for name, score in matches if score >= threshold]
+    return suggestions
+
 def handle_general_query(question, db):
-    """Handle general questions by querying the database directly"""
     query = db.query(Asset)
     question_lower = question.lower()
 
@@ -497,7 +554,6 @@ def handle_general_query(question, db):
     return QueryResponse(answer=result.strip(), assets=asset_items)
 
 def handle_asset_tag_lookup(asset_tag, db):
-    """Handle direct asset tag lookup"""
     asset = db.query(Asset).filter(Asset.asset_tag == asset_tag).first()
     if not asset:
         return QueryResponse(answer=f"No asset found with tag {asset_tag}")
@@ -505,7 +561,6 @@ def handle_asset_tag_lookup(asset_tag, db):
     return QueryResponse(answer=f"Asset Name: {asset.name}, Tag: {asset.asset_tag}, Serial: {asset.serial}, Purchase Date: {asset.purchase_date}")
 
 def handle_asset_filter_query(filters, db):
-    """Handle queries that filter assets by properties"""
     query = db.query(Asset)
     print(f"Applying filters: {filters}")
     
@@ -563,7 +618,6 @@ def handle_asset_filter_query(filters, db):
     return QueryResponse(answer=result, assets=asset_items)
 
 def handle_asset_count_query(filters, db):
-    """Handle queries that count assets with certain properties"""
     query = db.query(Asset)
     
     if "condition" in filters and filters["condition"] is not True:
@@ -587,4 +641,46 @@ def handle_asset_count_query(filters, db):
     if filter_desc:
         return QueryResponse(answer=f"Found {count} assets matching criteria: {filter_desc}")
     else:
-        return QueryResponse(answer=f"Total number of assets: {count}")
+        return QueryResponse(answer=f"Total number of assets: {count}")# LLM agent v1
+
+
+def handle_asset_checkout(filters: Dict,
+                          context: Dict,
+                          db: Session) -> QueryResponse:
+    """
+    Build the /assets/<id>/checkout URL for the requested asset.
+
+    Priority order for figuring out which asset to check out:
+    1.  filters["asset_id"]
+    2.  filters["asset_tag"]
+    3.  context["last_asset_id"]   ← value we stashed after a 1-asset result
+    """
+    asset = None
+
+    # ① explicit id from filters
+    if "asset_id" in filters:
+        asset = db.query(Asset).get(filters["asset_id"])
+
+    # ② explicit tag from filters
+    elif "asset_tag" in filters:
+        asset = db.query(Asset).filter(
+            Asset.asset_tag == filters["asset_tag"]
+        ).first()
+
+    # ③ single-asset follow-up (what you needed)
+    elif context.get("last_asset_id"):
+        asset = db.query(Asset).get(context["last_asset_id"])
+
+    # still nothing?  Tell the user.
+    if not asset:
+        return QueryResponse(
+            answer="I couldn’t figure out which asset you want to check out."
+        )
+
+    url = f"/assets/{asset.id}/checkout"
+    return QueryResponse(
+        answer=f"Here you go – hit the checkout page for **{asset.name}**.",
+        checkout_url=url
+    )
+
+
