@@ -361,6 +361,12 @@ def analyze_query_intent(question, db: Session, context: dict):
                         "unmatched_location": span
                     }
 
+    if intent == "asset_filter":
+        # if user did NOT mention status/asset this turn, wipe them
+        if "status_id" not in filters and "available" not in question_lower:
+            filters["status_id"] = None          # causes merge to overwrite
+        if "asset_id" not in filters:
+            filters["asset_id"] = None
     # Merge with previous context
     filters = merge_filters(context.get("filters", {}), filters)
     if intent == "asset_filter" and "location_id" not in filters and "location_id" in context.get("filters", {}):
