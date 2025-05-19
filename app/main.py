@@ -368,7 +368,32 @@ def analyze_query_intent(question, db: Session, context: dict):
         if "asset_id" not in filters:
             filters["asset_id"] = None
     # Merge with previous context
-    filters = merge_filters(context.get("filters", {}), filters)
+    # filters = merge_filters(context.get("filters", {}), filters)
+    #smarter merging
+    # With this glorious hybrid AI/rule blend:
+    question_lower = question.lower()
+    reset_keywords = ["all assets", "reset", "show everything", "start over", "clear filter"]
+    back_keywords = ["give me back all", "back all the assets", "return all the assets", "give back all"]
+
+    # CASE 1: Hard reset if explicitly asked
+    if any(kw in question_lower for kw in reset_keywords):
+        print("🧹 Resetting all filters by user command.")
+        filters = {}
+
+    # CASE 2: User says "give me back all" → drop recent filters, keep location
+    elif any(kw in question_lower for kw in back_keywords):
+        prev_filters = context.get("filters", {})
+        if "location_id" in prev_filters:
+            filters = {"location_id": prev_filters["location_id"]}
+            print("⏪ Keeping only location filter from previous context.")
+        else:
+            filters = {}
+            print("⏪ No prior location found — full reset triggered.")
+
+    # CASE 3: Normal merge
+    else:
+        filters = merge_filters(context.get("filters", {}), filters)
+
     if intent == "asset_filter" and "location_id" not in filters and "location_id" in context.get("filters", {}):
         if "only the available ones" in question.lower() or "available ones" in question.lower():
             filters["location_id"] = context["filters"]["location_id"]
@@ -574,7 +599,7 @@ def handle_asset_filter_query(filters, db):
         print(f"Filtering by condition: {filters['condition']}")
         query = query.filter(Asset.condition == filters["condition"])
     
-    if "status_id" in filters:
+    if filters.get("status_id") is not None:
         print(f"Filtering by status_id: {filters['status_id']}")
         query = query.filter(Asset.status_id == filters["status_id"])
     
