@@ -4,7 +4,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
 
-DATABASE_URL = "mysql+pymysql://root:root@localhost/new_bitch"
+DATABASE_URL = "mysql+pymysql://root:root@localhost/new_db_2"
 
 #create an engine
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -13,7 +13,7 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 try:
     with engine.connect() as connection:
         result = connection.execute(text("SELECT 1"))
-        print("Connection successful:", result.scalar())
+        print("Connection successful from new_db_2:", result.scalar())
 except Exception as e:
     print("Connection failed:", e)
 

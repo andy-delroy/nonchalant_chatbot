@@ -153,7 +153,8 @@ class Asset(Base):
     deleted_at = Column(DateTime, nullable=True)
     status_id = Column(Integer, ForeignKey('status.id', ondelete='SET NULL'), nullable=True, index=True)
     archived = Column(Boolean, default=False)
-    warrenty_months = Column(Integer, nullable=True)  # tinyint unsigned in MySQL maps to Integer
+    # warrenty_months = Column(Integer, nullable=True)  # tinyint unsigned in MySQL maps to Integer
+    warranty_expiry_date = Column(Date, nullable=True)
     warrenty_details = Column(String(255), nullable=True)
     requestable = Column(Boolean, nullable=False, default=True)
     requesting_user = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)

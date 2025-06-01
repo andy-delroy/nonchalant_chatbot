@@ -50,6 +50,14 @@ fine_tuned_ner/
 fine_tuned_ner_demo/
 fine_tuned_ner_v2/
 fine_tuned_ner_v3/
+fine_tuned_ner_v4_5_21/
+fine_tuned_ner_v4_5_21_noShuffle/
+fine_tuned_lower_case/
+fine_tuned_balanced_with_v3/
+fine_tune_balanced_with_tweak/
+fine_tuned_set2_with_tweak
+fine_tuned_set2_with_v3
+fine_tuned_balanced_with_tweak/
 
 results/
 

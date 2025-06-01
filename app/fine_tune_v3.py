@@ -22,7 +22,7 @@ model.config.id2label = {idx: label for idx, label in enumerate(labels)}
 print(f"Model num_labels: {model.config.num_labels}")
 
 # Load dataset without shuffling
-dataset = load_dataset("json", data_files="ner_dataset_v2.json", split="train")
+dataset = load_dataset("json", data_files="ner_fresh_balanced_dataset.json", split="train")
 dataset = dataset.train_test_split(test_size=0.2, shuffle=False)
 
 # Tokenize and align labels
@@ -95,5 +95,5 @@ trainer = Trainer(
 
 # Train and save
 trainer.train()
-model.save_pretrained("./fine_tuned_ner_v3")
-tokenizer.save_pretrained("./fine_tuned_ner_v3")
+model.save_pretrained("./fine_tuned_balanced_with_v3")
+tokenizer.save_pretrained("./fine_tuned_balanced_with_v3")
