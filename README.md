@@ -233,7 +233,7 @@ server {
 }
 ```
 
-### ☁️ Laravel Configuration (Remote URL)
+### Laravel Configuration (Remote URL)
 
 In Laravel `.env`, update the chatbot service endpoint:
 
